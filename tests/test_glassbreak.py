@@ -14,6 +14,69 @@ import glassbreak as gb
 
 
 class GlassbreakTests(unittest.TestCase):
+    def test_mixture_annotations_override_folders_and_keep_devtest_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = root / "meta"
+            meta.mkdir()
+            audio = root / "normal"  # Deliberately wrong folder: metadata is authoritative.
+            audio.mkdir()
+            ids = {}
+            expected_labels = {}
+            for split, count in (("devtrain", 20), ("devtest", 4)):
+                rows = []
+                for i in range(count):
+                    name = f"mixture_{split}_glassbreak_{i}.wav"
+                    (audio / name).touch()
+                    ids[name] = len(ids)
+                    if i % 2:
+                        if i % 4 == 1:
+                            # Exactly [3,6): neither adjacent window is positive.
+                            rows.append(f"{name}\t3\t6\tglassbreak")
+                            expected_labels[ids[name]] = [0, 1, 0]
+                        else:
+                            rows.append(f"{name}\t2.5\t3.5\tglassbreak")
+                            expected_labels[ids[name]] = [1, 1, 0]
+                    else:
+                        rows.append(name)
+                        expected_labels[ids[name]] = [0, 0, 0]
+                (meta / f"event_list_{split}_glassbreak.csv").write_text("\n".join(rows))
+            # An obsolete annotation must never be loaded.
+            (meta / "event_list_devtrain_babycry.csv_old_dontuse").write_text("invalid")
+
+            def fake_features(path):
+                return np.full((3, 64, 94), ids[Path(path).name], dtype=np.float32)
+
+            with patch.object(gb, "extract_features", side_effect=fake_features), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                splits = gb.prepare_data_pipeline(root, {}, meta)
+            groups = [set(x[:, 0, 0]) for x, _ in splits]
+            self.assertEqual(groups[2], set(range(20, 24)))
+            self.assertTrue(groups[0].isdisjoint(groups[1]))
+            self.assertEqual(groups[0] | groups[1], set(range(20)))
+            for features, labels in splits:
+                for i in range(0, len(labels), 3):
+                    expected = expected_labels[features[i, 0, 0]]
+                    np.testing.assert_array_equal(labels[i:i + 3], expected)
+            # Missing annotations must stop the pipeline instead of labeling normal.
+            (audio / "unknown.wav").touch()
+            with self.assertRaisesRegex(ValueError, "No annotation"):
+                gb.prepare_data_pipeline(root, {}, meta)
+
+    def test_event_parser_and_mixtures_require_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            name = "mixture_devtrain_babycry_000.wav"
+            path = root / "event_list_devtrain_babycry.csv"
+            path.write_text(f"{name}\t1.5\t2.5\tbabycry\n")
+            self.assertEqual(gb.load_event_annotations(root)[name], ("devtrain", (1.5, 2.5, "babycry")))
+            (root / name).touch()
+            with self.assertRaisesRegex(ValueError, "require --metadata-dir"):
+                gb.prepare_data_pipeline(root, {})
+            path.write_text(f"{name}\t4\t2\tbabycry\n")
+            with self.assertRaisesRegex(ValueError, "Invalid event"):
+                gb.load_event_annotations(root)
+
     def test_empty_audio_is_rejected(self):
         with patch.object(gb.librosa, "load", return_value=(np.array([]), 16000)), \
                 contextlib.redirect_stdout(io.StringIO()):

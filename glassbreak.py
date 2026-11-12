@@ -1,6 +1,8 @@
 import os
 import argparse
 import copy
+import csv
+from pathlib import Path
 import numpy as np
 import librosa
 from sklearn.model_selection import train_test_split
@@ -45,7 +47,91 @@ def extract_features(file_path, sr=16000, duration=3.0, n_mels=64):
         print(f"Error processing {file_path}: {e}")
         return None
 
-def prepare_data_pipeline(data_dir, label_map):
+def load_event_annotations(metadata_dir):
+    annotations = {}
+    for path in sorted(Path(metadata_dir).rglob("event_list_*.csv")):
+        parts = path.stem.split("_")
+        if len(parts) != 4 or parts[2] not in ("devtrain", "devtest"):
+            continue
+        subset, event_class = parts[2:]
+        with path.open(encoding="utf-8-sig", newline="") as source:
+            for line_number, row in enumerate(csv.reader(source, delimiter="\t"), 1):
+                if not row:
+                    continue
+                if len(row) not in (1, 4):
+                    raise ValueError(f"Invalid annotation: {path}:{line_number}")
+                name = row[0].replace("\\", "/").rsplit("/", 1)[-1]
+                if not name.startswith(f"mixture_{subset}_{event_class}_"):
+                    raise ValueError(f"Annotation filename does not match its list: {name}")
+                event = None
+                if len(row) == 4:
+                    start, end = float(row[1]), float(row[2])
+                    if not np.isfinite([start, end]).all() or not 0 <= start < end or row[3] != event_class:
+                        raise ValueError(f"Invalid event: {path}:{line_number}")
+                    event = (start, end, row[3])
+                if name in annotations:
+                    raise ValueError(f"Duplicate annotation for {name}")
+                annotations[name] = (subset, event)
+    if not annotations:
+        raise ValueError(f"No current event_list_*.csv annotations found in {metadata_dir}")
+    return annotations
+
+
+def prepare_mixture_data(data_dir, metadata_dir):
+    annotations = load_event_annotations(metadata_dir)
+    recordings = {"devtrain": [], "devtest": []}
+    seen = set()
+    for path in sorted(Path(data_dir).rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in (".wav", ".mp3", ".flac"):
+            continue
+        if path.name in seen:
+            raise ValueError(f"Duplicate audio filename: {path.name}")
+        seen.add(path.name)
+        if path.name not in annotations:
+            raise ValueError(f"No annotation for {path.name}; missing metadata is not a normal label. "
+                             "Exclude obsolete _old_dontuse recordings and preserve original filenames.")
+        subset, event = annotations[path.name]
+        recordings[subset].append((str(path), event))
+
+    # Official devtest remains untouched. Validation uses only devtrain recordings.
+    try:
+        train, validation = train_test_split(
+            recordings["devtrain"], test_size=0.2, random_state=42,
+            stratify=[int(event is not None and event[2] == "glassbreak")
+                      for _, event in recordings["devtrain"]])
+    except ValueError as error:
+        raise ValueError("Need enough annotated devtrain recordings with and without glass for validation.") from error
+
+    def build_windows(records, split):
+        features, labels = [], []
+        for path, event in records:
+            specs = extract_features(path)
+            if specs is None:
+                raise ValueError(f"Cannot use unreadable audio: {path}")
+            if event is not None and event[1] > len(specs) * 3:
+                raise ValueError(f"Annotation exceeds windowed audio duration: {path}")
+            for index, spec in enumerate(specs):
+                # Half-open intervals: an event on a boundary belongs to the next window.
+                glass = (event is not None and event[2] == "glassbreak"
+                         and event[0] < (index + 1) * 3 and event[1] > index * 3)
+                features.append(spec)
+                labels.append(int(glass))
+        if set(labels) != {0, 1}:
+            raise ValueError(f"{split} must contain both glass and non-glass windows")
+        print(f"{split}: {len(records)} recordings, {sum(labels)} glass windows, "
+              f"{len(labels) - sum(labels)} normal windows")
+        return np.array(features), np.array(labels)
+
+    return (build_windows(train, "train"), build_windows(validation, "validation"),
+            build_windows(recordings["devtest"], "test"))
+
+
+def prepare_data_pipeline(data_dir, label_map, metadata_dir=None):
+    if metadata_dir is not None:
+        return prepare_mixture_data(data_dir, metadata_dir)
+    if any(Path(data_dir).rglob("mixture_*.wav")):
+        raise ValueError("TUT mixtures require --metadata-dir with the current event_list_*.csv files; "
+                         "folder names cannot label their windows correctly.")
     files, labels = [], []
     
     for label_name, label_idx in label_map.items():
@@ -148,6 +234,7 @@ def train_and_evaluate_model(model, train_loader, val_loader, epochs=10, lr=0.00
             
         model.eval()
         correct, total = 0, 0
+        class_correct, class_total = [0, 0], [0, 0]
         val_loss = 0.0
         with torch.no_grad():
             for inputs, labels in val_loader:
@@ -159,10 +246,17 @@ def train_and_evaluate_model(model, train_loader, val_loader, epochs=10, lr=0.00
 
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
+                for class_id in (0, 1):
+                    mask = labels == class_id
+                    class_total[class_id] += mask.sum().item()
+                    class_correct[class_id] += ((predicted == labels) & mask).sum().item()
                 
         val_acc = correct / total if total > 0 else 0.0
-        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {running_loss/len(train_loader.dataset):.4f} | Val Accuracy: {val_acc:.4f}")
         val_loss /= total
+        balanced_acc = sum(c / n if n else 0 for c, n in zip(class_correct, class_total)) / 2
+        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {running_loss/len(train_loader.dataset):.4f} "
+              f"| Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc:.4f} "
+              f"| Val Balanced Accuracy: {balanced_acc:.4f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -199,6 +293,7 @@ def predict_file(file_path, checkpoint_path="best_glass_break_model.pth"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train on labeled recordings or classify every 3-second window.")
     parser.add_argument("--data-dir", default="./dataset")
+    parser.add_argument("--metadata-dir", help="Directory containing current TUT mixture event-list CSVs")
     parser.add_argument("--predict", metavar="AUDIO_FILE")
     parser.add_argument("--checkpoint", default="best_glass_break_model.pth")
     parser.add_argument("--epochs", type=int, default=30)
@@ -211,7 +306,7 @@ if __name__ == "__main__":
     if args.predict:
         predict_file(args.predict, args.checkpoint)
     elif os.path.exists(DATA_DIR):
-        train_data, val_data, test_data = prepare_data_pipeline(DATA_DIR, LABEL_MAP)
+        train_data, val_data, test_data = prepare_data_pipeline(DATA_DIR, LABEL_MAP, args.metadata_dir)
         # Fit normalization only on training audio; reuse it for all later inputs.
         mean = float(train_data[0].mean())
         std = max(float(train_data[0].std()), 1e-6)
