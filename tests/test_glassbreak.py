@@ -148,6 +148,19 @@ class GlassbreakTests(unittest.TestCase):
             with patch.object(gb, "extract_features", side_effect=fake_features), \
                     contextlib.redirect_stdout(io.StringIO()):
                 splits = gb.prepare_data_pipeline(root, {}, meta, include_references=True)
+                with patch.object(gb.librosa, 'load', return_value=(np.zeros(9 * 16000, dtype=np.float32), 16000)), \
+                        patch.object(gb, 'extract_audio_features', return_value=np.zeros((1, 64, 94))):
+                    augmented = gb.prepare_data_pipeline(root, {}, meta, include_references=True, event_crops=3)
+                self.assertGreater(len(augmented[0][1]), len(splits[0][1]))
+                for index in (1, 2):
+                    np.testing.assert_array_equal(augmented[index][0], splits[index][0])
+                    np.testing.assert_array_equal(augmented[index][1], splits[index][1])
+                    self.assertEqual(augmented[index][2], splits[index][2])
+                # All baseline train windows/backgrounds are retained before extra crops.
+                base_windows = {(ref['filename'], ref['start_seconds']) for ref in splits[0][2]}
+                augmented_windows = {(ref['filename'], ref['start_seconds']) for ref in augmented[0][2]}
+                self.assertTrue(base_windows <= augmented_windows)
+                self.assertEqual(sum(splits[0][1] == 0), sum(augmented[0][1] == 0))
             groups = [set(split[0][:, 0, 0]) for split in splits]
             self.assertEqual(groups[2], set(range(20, 24)))
             self.assertTrue(groups[0].isdisjoint(groups[1]))

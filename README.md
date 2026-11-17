@@ -21,7 +21,7 @@ training input. Missing metadata is an error, not an assumed negative label.
 Train and evaluate on held-out audio:
 
 ```sh
-python glassbreak.py --data-dir dataset --metadata-dir metadata --epochs 30 --checkpoint prototype_annotated.pth
+python glassbreak.py --data-dir dataset --metadata-dir metadata --recipes-dir metadata --event-crops 3 --epochs 30 --checkpoint prototype_grouped.pth
 ```
 
 Each non-overlapping three-second window is positive if it overlaps an annotated
@@ -29,12 +29,52 @@ Each non-overlapping three-second window is positive if it overlaps an annotated
 gunshot events. A filename-only annotation explicitly means no event. An event
 ending exactly at a window boundary does not label the following window positive.
 
-The provided `devtest` recordings are reserved for testing. Validation uses 20% of
-the available `devtrain` recordings, stratified by whether they contain glass.
-Mixtures can reuse source sounds and backgrounds, so this file-level validation
-split may share underlying sources with training; the official devtest split is
-the independent final assessment. Source-grouped validation would additionally
-require the mixture recipes. Audio windows from one file never cross splits.
+The provided `devtest` recordings are reserved for testing. For source-independent
+validation, use `--recipes-dir metadata`. The six official
+`mixture_recipes_devtrain_*.yaml` and `mixture_recipes_devtest_*.yaml` files are
+included beside the CSVs. They were extracted from the Zenodo development
+mixture archives 5 and 9 and checked against the current CSVs. These are mixture
+recipes, not the source event annotation YAMLs. CSVs alone cannot identify reused
+sources. Dataset source: https://zenodo.org/records/401395.
+
+With `--recipes-dir`, recordings sharing an original event file OR background
+recording session are joined into connected groups. Adjacent background slices
+such as `a001_0_30.wav` and `a001_30_60.wav` are grouped together. The program
+searches reproducibly for a group split near 80%/20% of devtrain, with both glass
+and non-glass recordings on each side. Counts can differ from a file split.
+Sources are also checked for overlap between devtrain and devtest. Missing,
+conflicting recipes stop the run: there is no silent file-split fallback when
+grouping is requested. If connected groups cannot form a usable split, a seeded
+source holdout reserves event/background sources for validation, retains only
+training recordings sharing none of those validation sources, and excludes
+cross-linked mixtures from this run. Exclusions are printed and recorded as
+`excluded` in `split_manifest.csv`; audio files are never deleted, moved, or
+relabeled. Candidate source partitions use only devtrain source identities and
+labels, never model predictions or test performance. The search prefers a near
+80/20 split among retained recordings, representative class proportions, and
+fewer exclusions. If no independent split with both classes exists, the run
+fails and requires additional independent sources.
+
+Without `--recipes-dir`, the legacy stratified file split is still available and
+prints a warning; this does not guarantee independent underlying sources.
+`split_manifest.csv` records the assignments and source-group identifiers. The
+checkpoint stores recording membership so later evaluation rejects changed splits.
+Audio windows/crops from one file never cross splits.
+
+Event-focused training crops
+----------------------------
+
+For annotation-based training, `--event-crops` defaults to 3. After splitting,
+up to three extra three-second crops are added per glass-event training recording,
+at different feasible positions around its annotated event. Events no longer
+than three seconds fit within these crops; longer events are covered in portions.
+Short clips are padded and duplicate crop positions are removed. Every original
+window from retained training recordings remains, including difficult background examples and glass
+fragments. Nothing is relabeled as normal simply because its overlap is short.
+No validation/test crops are added, and file/live inference still scans successive
+non-overlapping three-second windows. Set `--event-crops 0` for a controlled
+no-augmentation comparison. Retrain to benefit from these crops; evaluating old
+weights cannot teach the model new features.
 
 The original CNN architecture is retained. The pipeline normalizes using training
 statistics, weights the loss for class imbalance,
@@ -60,13 +100,17 @@ threshold. The selected threshold is saved alongside the model and normalization
 You can evaluate an existing annotation-trained model without retraining:
 
 ```sh
-python glassbreak.py --evaluate --data-dir dataset --metadata-dir metadata --checkpoint prototype_annotated.pth --report-dir reports
+python glassbreak.py --evaluate --data-dir dataset --metadata-dir metadata --recipes-dir metadata --checkpoint prototype_grouped.pth --report-dir reports_grouped
 ```
 
 Use the same audio collection and metadata as when that checkpoint was trained,
 so deterministic recording splits reproduce its held-out validation set. This
 does not recover historical splits if recordings were added, removed, or renamed.
-The saved normalization is reused. A new `prototype_annotated_calibrated.pth` is
+Use the same `--recipes-dir` setting as training. A legacy checkpoint without a
+split manifest cannot be evaluated on a newly grouped validation split: retrain
+first, since the old model may have seen those recordings. `--evaluate` never adds
+training crops or changes weights. The saved normalization is reused. A new
+`prototype_grouped_calibrated.pth` is
 written by default; `--calibrated-checkpoint path/to/output.pth` chooses another
 destination. Here "calibrated" means threshold selection, not probability
 calibration. The existing checkpoint is not overwritten by default.
@@ -83,6 +127,22 @@ Training/evaluation writes the following into `--report-dir` (default `reports/`
   by lowest score first, to help prioritize listening.
 - `summary.json`: selected threshold, selection rule, and validation/test metrics
   at both the selected threshold and the old 0.5 baseline.
+- `split_manifest.csv`: recording membership and source groups (when enabled).
+- `validation_events.csv` and `test_events.csv`: timed glass-event detection or
+  miss per recording and the number of false-alarm episodes.
+- `validation_alarm_episodes.csv` and `test_alarm_episodes.csv`: start/end times of
+  merged adjacent positive windows and whether each episode matched a glass event.
+
+Event summaries merge adjacent positive windows within each file into alarm
+episodes. An episode matches a glass event if their intervals overlap at all;
+at most one episode matches each event. Unmatched episodes count as false positives
+and unmatched events as false negatives. Thus missing one fragment need not mean
+missing the whole event. These are coarse overlap-based diagnostics, NOT official
+DCASE onset-collar metrics. Threshold selection remains based on validation WINDOW
+F1, not event F1. Event reports require timed annotations and are omitted for
+folder-only datasets. Retain window-level metrics too: a long positive episode can
+overlap glass while also covering substantial background. This is not a substitute
+for measuring real alarm timing/false alarms.
 
 Reports are window-level, not event-level alarm counts. Final partial windows
 include padding, so their nominal end time may exceed the real clip duration.
@@ -90,8 +150,8 @@ The report directory is reused/overwritten on each run; choose a different one
 to retain earlier experiments. Reports do not copy or modify audio files.
 Use validation errors to develop improvements and reserve test reports for final
 assessment; inspecting and tuning against test errors compromises a held-out test.
-These tools do not automatically improve the learned model, correct source-level
-validation overlap, or guarantee a higher test F1.
+Threshold evaluation does not change weights or guarantee a higher test F1.
+Event-focused crops affect training; source independence requires recipe grouping.
 
 For other, manually curated datasets, the original folder-label mode remains
 available by omitting `--metadata-dir`. This mode requires at least 7 independent

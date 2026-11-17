@@ -92,7 +92,8 @@ def window_reference(path, index, event=None):
                 event_end_seconds=event[1] if event else '')
 
 
-def prepare_mixture_data(data_dir, metadata_dir, include_references=False):
+def prepare_mixture_data(data_dir, metadata_dir, include_references=False, recipes_dir=None, event_crops=0,
+                         split_audit=None):
     annotations = load_event_annotations(metadata_dir)
     recordings = {"devtrain": [], "devtest": []}
     seen = set()
@@ -109,13 +110,22 @@ def prepare_mixture_data(data_dir, metadata_dir, include_references=False):
         recordings[subset].append((str(path), event))
 
     # Official devtest remains untouched. Validation uses only devtrain recordings.
-    try:
-        train, validation = train_test_split(
-            recordings["devtrain"], test_size=0.2, random_state=42,
-            stratify=[int(event is not None and event[2] == "glassbreak")
-                      for _, event in recordings["devtrain"]])
-    except ValueError as error:
-        raise ValueError("Need enough annotated devtrain recordings with and without glass for validation.") from error
+    group_map = {}
+    if recipes_dir is not None:
+        from training_data import load_recipes, grouped_recording_split
+        train, validation, group_map = grouped_recording_split(recordings, load_recipes(recipes_dir))
+        retained = {path for path, _ in train + validation}
+        if split_audit is not None:
+            split_audit['excluded'] = sorted(Path(path).name for path, _ in recordings['devtrain'] if path not in retained)
+    else:
+        print('Validation uses a file split; provide --recipes-dir for source-independent validation.')
+        try:
+            train, validation = train_test_split(
+                recordings["devtrain"], test_size=0.2, random_state=42,
+                stratify=[int(event is not None and event[2] == "glassbreak")
+                          for _, event in recordings["devtrain"]])
+        except ValueError as error:
+            raise ValueError("Need enough annotated devtrain recordings with and without glass for validation.") from error
 
     def build_windows(records, split):
         features, labels, references = [], [], []
@@ -131,7 +141,28 @@ def prepare_mixture_data(data_dir, metadata_dir, include_references=False):
                          and event[0] < (index + 1) * 3 and event[1] > index * 3)
                 features.append(spec)
                 labels.append(int(glass))
-                references.append(window_reference(path, index, event))
+                reference = window_reference(path, index, event)
+                reference['source_group'] = group_map.get(Path(path).name, '')
+                references.append(reference)
+            # Keep every original window, including difficult background and fragments.
+            # Add complete/long-event crops ONLY to training, after the recording split.
+            if split == 'train' and event_crops and event is not None and event[2] == 'glassbreak':
+                from training_data import event_crop_starts
+                audio, sr = librosa.load(path, sr=16000)
+                starts = event_crop_starts(event[0], event[1], len(audio) / sr, event_crops)
+                seen_starts = set()
+                for start in starts:
+                    first = round(start * sr)
+                    if first in seen_starts:
+                        continue
+                    seen_starts.add(first)
+                    crop = audio[first:first + sr * 3]
+                    features.append(extract_audio_features(crop)[0])
+                    labels.append(1)
+                    reference = window_reference(path, 0, event)
+                    reference.update(start_seconds=first / sr, end_seconds=first / sr + 3,
+                                     source_group=group_map.get(Path(path).name, ''))
+                    references.append(reference)
         if set(labels) != {0, 1}:
             raise ValueError(f"{split} must contain both glass and non-glass windows")
         print(f"{split}: {len(records)} recordings, {sum(labels)} glass windows, "
@@ -143,9 +174,10 @@ def prepare_mixture_data(data_dir, metadata_dir, include_references=False):
             build_windows(recordings["devtest"], "test"))
 
 
-def prepare_data_pipeline(data_dir, label_map, metadata_dir=None, include_references=False):
+def prepare_data_pipeline(data_dir, label_map, metadata_dir=None, include_references=False,
+                          recipes_dir=None, event_crops=0, split_audit=None):
     if metadata_dir is not None:
-        return prepare_mixture_data(data_dir, metadata_dir, include_references)
+        return prepare_mixture_data(data_dir, metadata_dir, include_references, recipes_dir, event_crops, split_audit)
     if any(Path(data_dir).rglob("mixture_*.wav")):
         raise ValueError("TUT mixtures require --metadata-dir with the current event_list_*.csv files; "
                          "folder names cannot label their windows correctly.")
@@ -423,6 +455,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train on labeled recordings or classify every 3-second window.")
     parser.add_argument("--data-dir", default="./dataset")
     parser.add_argument("--metadata-dir", help="Directory containing current TUT mixture event-list CSVs")
+    parser.add_argument("--recipes-dir", help="TUT recipe YAML directory; enables source-grouped validation")
+    parser.add_argument("--event-crops", type=int, default=3,
+                        help="Additional event-focused crops per glass training recording (default 3; 0 disables)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--predict", metavar="AUDIO_FILE")
     mode.add_argument("--live", action="store_true", help="Classify microphone audio until Ctrl+C")
@@ -442,6 +477,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default="best_glass_break_model.pth")
     parser.add_argument("--epochs", type=int, default=30)
     args = parser.parse_args()
+    if args.event_crops < 0:
+        parser.error('--event-crops must be nonnegative')
+    if args.recipes_dir and not args.metadata_dir:
+        parser.error('--recipes-dir requires --metadata-dir')
     if args.threshold is not None and not 0 <= args.threshold <= 1:
         parser.error("--threshold must be between 0 and 1")
     if args.threshold is not None and not (args.live or args.predict):
@@ -471,16 +510,28 @@ if __name__ == "__main__":
     elif args.predict:
         predict_file(args.predict, args.checkpoint, args.threshold)
     elif os.path.exists(DATA_DIR):
+        split_audit = {}
         train_data, val_data, test_data = prepare_data_pipeline(
-            DATA_DIR, LABEL_MAP, args.metadata_dir, include_references=True)
+            DATA_DIR, LABEL_MAP, args.metadata_dir, include_references=True,
+            recipes_dir=args.recipes_dir, event_crops=0 if args.evaluate else args.event_crops, split_audit=split_audit)
+        split_files = {name: sorted({ref['filename'] for ref in split[2]})
+                       for name, split in zip(('train', 'validation', 'test'), (train_data, val_data, test_data))}
+        if split_audit.get('excluded'):
+            split_files['excluded'] = split_audit['excluded']
         # Fit normalization only on training audio; reuse it for all later inputs.
         if args.evaluate:
             model, checkpoint = load_prediction_model(args.checkpoint)
+            if 'split_files' in checkpoint and checkpoint['split_files'] != split_files:
+                raise ValueError('Recording splits differ from this checkpoint. Use the original audio/recipes '
+                                 'or retrain; evaluating on a new validation split can leak training recordings.')
+            if args.recipes_dir and 'split_files' not in checkpoint:
+                raise ValueError('Legacy checkpoint has no split manifest. Retrain with --recipes-dir '
+                                 'before evaluating source-grouped validation.')
             mean, std = checkpoint['mean'], checkpoint['std']
         else:
             mean = float(train_data[0].mean())
             std = max(float(train_data[0].std()), 1e-6)
-        val_references, test_references = val_data[2], test_data[2]
+        train_references, val_references, test_references = train_data[2], val_data[2], test_data[2]
         train_data = ((train_data[0] - mean) / std, train_data[1])
         val_data = ((val_data[0] - mean) / std, val_data[1])
         test_data = ((test_data[0] - mean) / std, test_data[1])
@@ -509,14 +560,31 @@ if __name__ == "__main__":
         for name in ('validation_at_0_5', 'validation', 'test_at_0_5', 'test'):
             result = summary[name]
             print(f"{name}: precision={result['precision']:.4f}, recall={result['recall']:.4f}, F1={result['f1']:.4f}")
+        for name in ('validation_events', 'test_events'):
+            if name in summary:
+                result = summary[name]
+                print(f"{name} (overlap-based): precision={result['precision']:.4f}, "
+                      f"recall={result['recall']:.4f}, F1={result['f1']:.4f}, "
+                      f"detected={result['true_positive']}, missed={result['false_negative']}, "
+                      f"false_alarm_episodes={result['false_positive']}")
         output_checkpoint = args.checkpoint
         if args.evaluate:
             original = Path(args.checkpoint)
             output_checkpoint = args.calibrated_checkpoint or str(original.with_name(original.stem + '_calibrated' + original.suffix))
         torch.save({'model_state': trained_model.state_dict(), 'input_shape': list(sample_spec.shape),
                     'mean': mean, 'std': std, 'threshold': threshold,
+                    'split_files': split_files, 'split_strategy': 'source_groups' if args.recipes_dir else 'files',
                     'threshold_selection': 'maximum validation glass F1'}, output_checkpoint)
         print(f"Checkpoint saved to {output_checkpoint}; window-level reports saved to {args.report_dir}")
+        from evaluation import write_csv
+        split_rows = []
+        group_lookup = {ref['filename']: ref.get('source_group', '')
+                        for ref in train_references + val_references + test_references}
+        for split_name, filenames in split_files.items():
+            split_rows.extend(dict(split=split_name, filename=name,
+                                   source_group='excluded-cross-source' if split_name == 'excluded' else group_lookup.get(name, ''))
+                              for name in filenames)
+        write_csv(Path(args.report_dir) / 'split_manifest.csv', split_rows, ['split', 'filename', 'source_group'])
         predictions = (np.asarray(test_scores) >= threshold).astype(int)
         print("Test confusion matrix (rows: actual, columns: predicted; normal, glass_breaking):")
         print(confusion_matrix(test_data[1], predictions, labels=[0, 1]))

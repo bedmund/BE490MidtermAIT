@@ -64,3 +64,23 @@ class EvaluationTests(unittest.TestCase):
                 ev.evaluate_thresholds(labels, scores)
         with self.assertRaises(ValueError):
             ev.select_validation_threshold([0, 0], [0.1, 0.2])
+
+    def test_event_split_across_windows_is_detected_once_and_background_alarms_count(self):
+        references = []
+        for filename, event in [('glass.wav', True), ('normal.wav', False), ('missed.wav', True)]:
+            for index in range(4):
+                references.append(dict(file_path='/audio/' + filename, filename=filename,
+                                       start_seconds=index * 3, end_seconds=(index + 1) * 3,
+                                       event_label='glassbreak' if event else '',
+                                       event_start_seconds=2.9 if event else '',
+                                       event_end_seconds=3.5 if event else ''))
+        # One fragment detected in glass.wav is enough; adjacent alarms merge.
+        scores = [0.1, 0.9, 0.9, 0.1, 0.9, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1]
+        with tempfile.TemporaryDirectory() as directory:
+            result = ev.write_event_reports(directory, 'validation', references, scores, 0.5)
+            self.assertEqual(result['true_positive'], 1)
+            self.assertEqual(result['false_negative'], 1)
+            self.assertEqual(result['false_positive'], 2)
+            self.assertEqual(result['recall'], 0.5)
+            with Path(directory, 'validation_alarm_episodes.csv').open(newline='') as source:
+                self.assertEqual(len(list(csv.DictReader(source))), 3)

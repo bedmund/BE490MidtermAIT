@@ -71,6 +71,7 @@ def write_window_reports(directory, split, references, labels, scores, threshold
                          predicted_label='glass_breaking' if predicted else 'normal',
                          glass_score=float(score), threshold=float(threshold), error_type=outcome))
     fields = ['split', 'file_path', 'filename', 'start_seconds', 'end_seconds',
+              'source_group',
               'event_label', 'event_start_seconds', 'event_end_seconds',
               'actual_label', 'predicted_label', 'glass_score', 'threshold', 'error_type']
     write_csv(directory / f'{split}_predictions.csv', rows, fields)
@@ -78,6 +79,61 @@ def write_window_reports(directory, split, references, labels, scores, threshold
                     key=lambda row: (0 if row['error_type'] == 'false_positive' else 1,
                                      -row['glass_score'] if row['error_type'] == 'false_positive' else row['glass_score']))
     write_csv(directory / f'{split}_errors.csv', errors, fields)
+
+
+def write_event_reports(directory, split, references, scores, threshold):
+    """Merge adjacent positive windows and match at most one episode per event.
+
+    This is coarse interval-overlap scoring, NOT DCASE onset-collar scoring.
+    TUT mixtures have at most one target event, which can span multiple windows.
+    """
+    recordings = {}
+    for reference, score in zip(references, scores):
+        recordings.setdefault(reference['file_path'], []).append((reference, float(score)))
+    event_rows, episode_rows = [], []
+    tp = fp = fn = 0
+    for path, windows in sorted(recordings.items()):
+        windows.sort(key=lambda item: item[0]['start_seconds'])
+        reference = windows[0][0]
+        target = reference['event_label'] == 'glassbreak'
+        start = float(reference['event_start_seconds']) if target else None
+        end = float(reference['event_end_seconds']) if target else None
+        episodes = []
+        for window, score in windows:
+            if score < threshold:
+                continue
+            first, last = window['start_seconds'], window['end_seconds']
+            if episodes and first <= episodes[-1][1]:
+                episodes[-1][1] = max(last, episodes[-1][1])
+            else:
+                episodes.append([first, last])
+        matched = None
+        for first, last in episodes:
+            hit = target and matched is None and first < end and last > start
+            if hit:
+                matched = (first, last)
+                tp += 1
+            else:
+                fp += 1
+            episode_rows.append(dict(split=split, file_path=path, filename=reference['filename'],
+                                     start_seconds=first, end_seconds=last,
+                                     outcome='matched_glass_event' if hit else 'false_alarm_episode'))
+        fn += int(target and matched is None)
+        event_rows.append(dict(split=split, file_path=path, filename=reference['filename'],
+                               has_glass_event=int(target), event_start_seconds=start if target else '',
+                               event_end_seconds=end if target else '', detected=int(matched is not None),
+                               alarm_episodes=len(episodes), false_alarm_episodes=len(episodes) - int(matched is not None)))
+    directory = Path(directory)
+    write_csv(directory / f'{split}_events.csv', event_rows,
+              ['split', 'file_path', 'filename', 'has_glass_event', 'event_start_seconds',
+               'event_end_seconds', 'detected', 'alarm_episodes', 'false_alarm_episodes'])
+    write_csv(directory / f'{split}_alarm_episodes.csv', episode_rows,
+              ['split', 'file_path', 'filename', 'start_seconds', 'end_seconds', 'outcome'])
+    return dict(precision=tp / (tp + fp) if tp + fp else 0.0,
+                recall=tp / (tp + fn) if tp + fn else 0.0,
+                f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0,
+                true_positive=tp, false_positive=fp, false_negative=fn,
+                metric='merged positive-window episodes matched by any interval overlap; not DCASE scoring')
 
 
 def evaluate_and_report(validation, test, directory):
@@ -93,6 +149,8 @@ def evaluate_and_report(validation, test, directory):
                    validation_at_0_5=evaluate_thresholds(val_labels, val_scores, [0.5])[0])
     for split, (labels, scores, references) in [('validation', validation), ('test', test)]:
         write_window_reports(directory, split, references, labels, scores, threshold)
+        if any(ref['event_label'] == 'glassbreak' for ref in references):
+            summary[f'{split}_events'] = write_event_reports(directory, split, references, scores, threshold)
         if split == 'test':
             summary['test'] = evaluate_thresholds(labels, scores, [threshold])[0]
             summary['test_at_0_5'] = evaluate_thresholds(labels, scores, [0.5])[0]

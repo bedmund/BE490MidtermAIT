@@ -4,6 +4,7 @@ scikit-learn
 torch>=2.0
 sounddevice>=0.4
 gpiozero>=2.0
+PyYAML>=6.0
 
 # Gmail email alerts use Python's built-in smtplib, ssl, and email modules.
 # No additional third-party package is required for email alerts.
