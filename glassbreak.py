@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from evaluation import metrics_from_counts, evaluate_and_report
 
 class AudioDataset(Dataset):
     def __init__(self, features, labels):
@@ -83,7 +84,15 @@ def load_event_annotations(metadata_dir):
     return annotations
 
 
-def prepare_mixture_data(data_dir, metadata_dir):
+def window_reference(path, index, event=None):
+    return dict(file_path=str(Path(path).resolve()), filename=Path(path).name,
+                start_seconds=index * 3, end_seconds=(index + 1) * 3,
+                event_label=event[2] if event else '',
+                event_start_seconds=event[0] if event else '',
+                event_end_seconds=event[1] if event else '')
+
+
+def prepare_mixture_data(data_dir, metadata_dir, include_references=False):
     annotations = load_event_annotations(metadata_dir)
     recordings = {"devtrain": [], "devtest": []}
     seen = set()
@@ -109,7 +118,7 @@ def prepare_mixture_data(data_dir, metadata_dir):
         raise ValueError("Need enough annotated devtrain recordings with and without glass for validation.") from error
 
     def build_windows(records, split):
-        features, labels = [], []
+        features, labels, references = [], [], []
         for path, event in records:
             specs = extract_features(path)
             if specs is None:
@@ -122,19 +131,21 @@ def prepare_mixture_data(data_dir, metadata_dir):
                          and event[0] < (index + 1) * 3 and event[1] > index * 3)
                 features.append(spec)
                 labels.append(int(glass))
+                references.append(window_reference(path, index, event))
         if set(labels) != {0, 1}:
             raise ValueError(f"{split} must contain both glass and non-glass windows")
         print(f"{split}: {len(records)} recordings, {sum(labels)} glass windows, "
               f"{len(labels) - sum(labels)} normal windows")
-        return np.array(features), np.array(labels)
+        result = (np.array(features), np.array(labels))
+        return result + (references,) if include_references else result
 
     return (build_windows(train, "train"), build_windows(validation, "validation"),
             build_windows(recordings["devtest"], "test"))
 
 
-def prepare_data_pipeline(data_dir, label_map, metadata_dir=None):
+def prepare_data_pipeline(data_dir, label_map, metadata_dir=None, include_references=False):
     if metadata_dir is not None:
-        return prepare_mixture_data(data_dir, metadata_dir)
+        return prepare_mixture_data(data_dir, metadata_dir, include_references)
     if any(Path(data_dir).rglob("mixture_*.wav")):
         raise ValueError("TUT mixtures require --metadata-dir with the current event_list_*.csv files; "
                          "folder names cannot label their windows correctly.")
@@ -161,16 +172,18 @@ def prepare_data_pipeline(data_dir, label_map, metadata_dir=None):
                          "for stratified train/validation/test splits (at least 7 per class).") from e
 
     def build_windows(paths, file_labels):
-        features, window_labels = [], []
+        features, window_labels, references = [], [], []
         for path, label in zip(paths, file_labels):
             specs = extract_features(path)
             if specs is None:
                 raise ValueError(f"Cannot use unreadable audio: {path}")
             features.extend(specs)
             window_labels.extend([label] * len(specs))
+            references.extend(window_reference(path, index) for index in range(len(specs)))
         if set(window_labels) != {0, 1}:
             raise ValueError("Each split must contain both normal and glass-breaking recordings")
-        return np.array(features), np.array(window_labels)
+        result = (np.array(features), np.array(window_labels))
+        return result + (references,) if include_references else result
 
     return (build_windows(train_files, train_labels),
             build_windows(val_files, val_labels), build_windows(test_files, test_labels))
@@ -260,9 +273,13 @@ def train_and_evaluate_model(model, train_loader, val_loader, epochs=10, lr=0.00
         val_acc = correct / total if total > 0 else 0.0
         val_loss /= total
         balanced_acc = sum(c / n if n else 0 for c, n in zip(class_correct, class_total)) / 2
+        val_metrics = metrics_from_counts(class_correct[0], class_total[0] - class_correct[0],
+                                         class_total[1] - class_correct[1], class_correct[1])
         print(f"Epoch [{epoch+1}/{epochs}] | Loss: {running_loss/len(train_loader.dataset):.4f} "
               f"| Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc:.4f} "
-              f"| Val Balanced Accuracy: {balanced_acc:.4f}")
+              f"| Val Balanced Accuracy: {balanced_acc:.4f} "
+              f"| Val Precision: {val_metrics['precision']:.4f} | Val Recall: {val_metrics['recall']:.4f} "
+              f"| Val F1: {val_metrics['f1']:.4f} (threshold 0.5)")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -301,8 +318,16 @@ def print_prediction(index, probability, threshold=0.5):
     print(f"{index * 3:.1f}-{(index + 1) * 3:.1f}s: {label} (glass score: {probability:.3f})", flush=True)
 
 
-def predict_file(file_path, checkpoint_path="best_glass_break_model.pth", threshold=0.5):
+def resolve_threshold(checkpoint, override=None):
+    threshold = float(checkpoint.get('threshold', 0.5) if override is None else override)
+    if not np.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("Prediction threshold must be finite and between 0 and 1")
+    return threshold
+
+
+def predict_file(file_path, checkpoint_path="best_glass_break_model.pth", threshold=None):
     model, checkpoint = load_prediction_model(checkpoint_path)
+    threshold = resolve_threshold(checkpoint, threshold)
     specs = extract_features(file_path)
     if specs is None:
         raise ValueError(f"Cannot read audio: {file_path}")
@@ -321,10 +346,11 @@ def get_audio_backend():
     return sd
 
 
-def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, threshold=0.5,
+def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, threshold=None,
                  alarm_mode="off", led_pin=17, buzzer_pin=27, alarm_seconds=3.0,
                  email_alerts=False, email_cooldown=60.0):
     model, checkpoint = load_prediction_model(checkpoint_path)
+    threshold = resolve_threshold(checkpoint, threshold)
     sd = get_audio_backend()
     # Capture at the microphone's native rate, then resample to the training rate.
     input_device = sd.query_devices(device, "input")
@@ -402,7 +428,10 @@ if __name__ == "__main__":
     mode.add_argument("--live", action="store_true", help="Classify microphone audio until Ctrl+C")
     mode.add_argument("--list-input-devices", action="store_true", help="List audio devices and exit")
     parser.add_argument("--device", type=int, help="Microphone device index (default: system input)")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Glass score threshold for prediction")
+    mode.add_argument("--evaluate", action="store_true", help="Evaluate/calibrate an existing checkpoint without training")
+    parser.add_argument("--threshold", type=float, help="Override saved threshold for live/file prediction")
+    parser.add_argument("--report-dir", default="reports", help="Directory for validation/test CSVs and summary.json")
+    parser.add_argument("--calibrated-checkpoint", help="Output checkpoint for --evaluate (default: original name plus _calibrated)")
     parser.add_argument("--alarm", choices=("off", "simulate", "gpio"), default="off",
                         help="Live light/buzzer alarm (simulate needs no hardware)")
     parser.add_argument("--led-pin", type=int, default=17, help="LED BCM GPIO pin")
@@ -413,8 +442,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default="best_glass_break_model.pth")
     parser.add_argument("--epochs", type=int, default=30)
     args = parser.parse_args()
-    if not 0 < args.threshold < 1:
+    if args.threshold is not None and not 0 <= args.threshold <= 1:
         parser.error("--threshold must be between 0 and 1")
+    if args.threshold is not None and not (args.live or args.predict):
+        parser.error("--threshold is only for live/file prediction; evaluation selects it from validation data")
+    if args.calibrated_checkpoint and not args.evaluate:
+        parser.error("--calibrated-checkpoint requires --evaluate")
     if args.email_alerts and (not args.live or not np.isfinite(args.email_cooldown) or args.email_cooldown <= 0):
         parser.error("--email-alerts requires --live and a positive finite --email-cooldown")
     if args.alarm != "off":
@@ -438,10 +471,16 @@ if __name__ == "__main__":
     elif args.predict:
         predict_file(args.predict, args.checkpoint, args.threshold)
     elif os.path.exists(DATA_DIR):
-        train_data, val_data, test_data = prepare_data_pipeline(DATA_DIR, LABEL_MAP, args.metadata_dir)
+        train_data, val_data, test_data = prepare_data_pipeline(
+            DATA_DIR, LABEL_MAP, args.metadata_dir, include_references=True)
         # Fit normalization only on training audio; reuse it for all later inputs.
-        mean = float(train_data[0].mean())
-        std = max(float(train_data[0].std()), 1e-6)
+        if args.evaluate:
+            model, checkpoint = load_prediction_model(args.checkpoint)
+            mean, std = checkpoint['mean'], checkpoint['std']
+        else:
+            mean = float(train_data[0].mean())
+            std = max(float(train_data[0].std()), 1e-6)
+        val_references, test_references = val_data[2], test_data[2]
         train_data = ((train_data[0] - mean) / std, train_data[1])
         val_data = ((val_data[0] - mean) / std, val_data[1])
         test_data = ((test_data[0] - mean) / std, test_data[1])
@@ -450,16 +489,35 @@ if __name__ == "__main__":
         val_loader = DataLoader(AudioDataset(*val_data), batch_size=16, shuffle=False)
         
         sample_spec = train_data[0][0]
-        model = BaselineAudioCNN(input_height=sample_spec.shape[0], input_width=sample_spec.shape[1])
-        
-        trained_model = train_and_evaluate_model(model, train_loader, val_loader, epochs=args.epochs)
-        torch.save({"model_state": trained_model.cpu().state_dict(),
-                    "input_shape": list(sample_spec.shape), "mean": mean, "std": std}, args.checkpoint)
+        if args.evaluate:
+            trained_model = model
+        else:
+            model = BaselineAudioCNN(input_height=sample_spec.shape[0], input_width=sample_spec.shape[1])
+            trained_model = train_and_evaluate_model(model, train_loader, val_loader, epochs=args.epochs)
+        trained_model.cpu().eval()
+
+        # Select the threshold only on the best model's validation predictions.
+        val_scores = predict_features(trained_model, {'mean': 0.0, 'std': 1.0}, val_data[0])
         test_loader = DataLoader(AudioDataset(*test_data), batch_size=16, shuffle=False)
-        predictions = []
+        test_scores = []
         with torch.no_grad():
             for inputs, _ in test_loader:
-                predictions.extend((torch.sigmoid(trained_model(inputs)) >= 0.5).int().flatten().tolist())
+                test_scores.extend(torch.sigmoid(trained_model(inputs)).flatten().tolist())
+        threshold, summary = evaluate_and_report(
+            (val_data[1], val_scores, val_references), (test_data[1], test_scores, test_references), args.report_dir)
+        print(f"Selected threshold (validation glass F1): {threshold:.6g}")
+        for name in ('validation_at_0_5', 'validation', 'test_at_0_5', 'test'):
+            result = summary[name]
+            print(f"{name}: precision={result['precision']:.4f}, recall={result['recall']:.4f}, F1={result['f1']:.4f}")
+        output_checkpoint = args.checkpoint
+        if args.evaluate:
+            original = Path(args.checkpoint)
+            output_checkpoint = args.calibrated_checkpoint or str(original.with_name(original.stem + '_calibrated' + original.suffix))
+        torch.save({'model_state': trained_model.state_dict(), 'input_shape': list(sample_spec.shape),
+                    'mean': mean, 'std': std, 'threshold': threshold,
+                    'threshold_selection': 'maximum validation glass F1'}, output_checkpoint)
+        print(f"Checkpoint saved to {output_checkpoint}; window-level reports saved to {args.report_dir}")
+        predictions = (np.asarray(test_scores) >= threshold).astype(int)
         print("Test confusion matrix (rows: actual, columns: predicted; normal, glass_breaking):")
         print(confusion_matrix(test_data[1], predictions, labels=[0, 1]))
         print(classification_report(test_data[1], predictions, labels=[0, 1],

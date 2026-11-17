@@ -46,6 +46,53 @@ It reports per-split window counts and balanced validation accuracy, because
 correct labels produce many more background windows than glass windows. Review
 glass recall and normal recall as well as ordinary accuracy.
 
+Validation thresholds and error reports
+--------------------------------------
+
+Each training epoch also prints validation glass precision, recall, and F1 at the
+fixed 0.5 threshold. Model weights are still selected by lowest validation loss.
+After restoring those weights, the program evaluates every distinct validation
+score as a candidate threshold, plus 0, 0.5, and 1. It selects maximum validation
+glass F1; ties prefer higher precision, then closeness to 0.5, then the higher
+threshold. Predictions use `score >= threshold`. Test data never selects the
+threshold. The selected threshold is saved alongside the model and normalization.
+
+You can evaluate an existing annotation-trained model without retraining:
+
+```sh
+python glassbreak.py --evaluate --data-dir dataset --metadata-dir metadata --checkpoint prototype_annotated.pth --report-dir reports
+```
+
+Use the same audio collection and metadata as when that checkpoint was trained,
+so deterministic recording splits reproduce its held-out validation set. This
+does not recover historical splits if recordings were added, removed, or renamed.
+The saved normalization is reused. A new `prototype_annotated_calibrated.pth` is
+written by default; `--calibrated-checkpoint path/to/output.pth` chooses another
+destination. Here "calibrated" means threshold selection, not probability
+calibration. The existing checkpoint is not overwritten by default.
+
+Training/evaluation writes the following into `--report-dir` (default `reports/`):
+
+- `validation_thresholds.csv`: precision, recall, F1, accuracy, balanced accuracy,
+  and confusion counts for every candidate threshold.
+- `validation_predictions.csv` and `test_predictions.csv`: every window's audio
+  path, filename, start/end seconds, event annotation, actual/predicted label,
+  glass score, and selected threshold.
+- `validation_errors.csv` and `test_errors.csv`: only false positives and false
+  negatives. False positives are sorted by highest score first; false negatives
+  by lowest score first, to help prioritize listening.
+- `summary.json`: selected threshold, selection rule, and validation/test metrics
+  at both the selected threshold and the old 0.5 baseline.
+
+Reports are window-level, not event-level alarm counts. Final partial windows
+include padding, so their nominal end time may exceed the real clip duration.
+The report directory is reused/overwritten on each run; choose a different one
+to retain earlier experiments. Reports do not copy or modify audio files.
+Use validation errors to develop improvements and reserve test reports for final
+assessment; inspecting and tuning against test errors compromises a held-out test.
+These tools do not automatically improve the learned model, correct source-level
+validation overlap, or guarantee a higher test F1.
+
 For other, manually curated datasets, the original folder-label mode remains
 available by omitting `--metadata-dir`. This mode requires at least 7 independent
 recordings per class and glass breaking in every window of glass-labeled files.
@@ -101,9 +148,12 @@ latency). Ctrl+C closes the microphone; unfinished audio is discarded. Audio is
 held in memory only and is not saved or transmitted. Capture errors or a full
 four-window queue stop monitoring with an error rather than silently losing audio.
 
-Prediction uses threshold 0.5 by default. Both `--live` and `--predict` accept
-`--threshold`, e.g. `--threshold 0.7`; choose a threshold using validation data,
-not test data. This option does not change training or its evaluation threshold.
+Prediction uses the checkpoint's saved threshold by default; older checkpoints
+without one fall back to 0.5. Both `--live` and `--predict` accept an explicit
+`--threshold`, e.g. `--threshold 0.7`, which overrides the saved value without
+modifying the checkpoint. Training/evaluation selects thresholds using validation
+data and rejects this manual override. To use a separately evaluated checkpoint,
+pass `--checkpoint prototype_annotated_calibrated.pth` for file or live prediction.
 Live capture does not improve the existing model's detection accuracy; the
 previously observed false alarms and missed events remain relevant.
 

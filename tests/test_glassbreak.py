@@ -147,12 +147,16 @@ class GlassbreakTests(unittest.TestCase):
 
             with patch.object(gb, "extract_features", side_effect=fake_features), \
                     contextlib.redirect_stdout(io.StringIO()):
-                splits = gb.prepare_data_pipeline(root, {}, meta)
-            groups = [set(x[:, 0, 0]) for x, _ in splits]
+                splits = gb.prepare_data_pipeline(root, {}, meta, include_references=True)
+            groups = [set(split[0][:, 0, 0]) for split in splits]
             self.assertEqual(groups[2], set(range(20, 24)))
             self.assertTrue(groups[0].isdisjoint(groups[1]))
             self.assertEqual(groups[0] | groups[1], set(range(20)))
-            for features, labels in splits:
+            for features, labels, references in splits:
+                self.assertEqual(len(references), len(labels))
+                for index, reference in enumerate(references):
+                    self.assertEqual(ids[reference['filename']], features[index, 0, 0])
+                    self.assertEqual(reference['start_seconds'], (index % 3) * 3)
                 for i in range(0, len(labels), 3):
                     expected = expected_labels[features[i, 0, 0]]
                     np.testing.assert_array_equal(labels[i:i + 3], expected)
@@ -254,6 +258,20 @@ class GlassbreakTests(unittest.TestCase):
             torch.save(model.state_dict(), checkpoint)
             with self.assertRaisesRegex(ValueError, "Retrain"):
                 gb.predict_file("clip.wav", checkpoint)
+
+    def test_saved_threshold_and_explicit_override(self):
+        self.assertEqual(gb.resolve_threshold({}), 0.5)
+        self.assertEqual(gb.resolve_threshold({'threshold': 0.8}), 0.8)
+        self.assertEqual(gb.resolve_threshold({'threshold': 0.8}, 0.4), 0.4)
+        with self.assertRaises(ValueError):
+            gb.resolve_threshold({'threshold': float('nan')})
+        with patch.object(gb, 'load_prediction_model', return_value=(None, {'threshold': 0.9})), \
+                patch.object(gb, 'extract_features', return_value=np.zeros((2, 64, 94))), \
+                patch.object(gb, 'predict_features', return_value=[0.8, 0.9]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            gb.predict_file('clip.wav')
+        self.assertIn('0.0-3.0s: normal', output.getvalue())
+        self.assertIn('3.0-6.0s: glass_breaking', output.getvalue())
 
 
 if __name__ == "__main__":
