@@ -109,4 +109,49 @@ previously observed false alarms and missed events remain relevant.
 
 Phone notifications are not implemented.
 
+Optional light and active-buzzer alarm
+------------------------------------
+
+For the project without Raspberry Pi hardware, simulate both outputs:
+
+```sh
+python glassbreak.py --live --checkpoint prototype_annotated.pth --alarm simulate --alarm-seconds 5
+```
+
+The console displays `ALARM (simulate): light ON, buzzer ON` on a detection and
+an OFF message after the hold interval. Simulation does not access GPIO, emit
+sound from the computer speaker, or switch a physical lamp. Ordinary `--live`
+leaves the alarm disabled.
+
+For a future Raspberry Pi with GPIO-connected components:
+
+```sh
+python glassbreak.py --live --checkpoint prototype_annotated.pth --alarm gpio --led-pin 17 --buzzer-pin 27 --alarm-seconds 5
+```
+
+Pin numbers use BCM numbering, not physical header positions. Outputs are
+active-high and initialized OFF. Use a GPIO-compatible LED with a series resistor
+and an active buzzer or suitable driver circuit; powered lamps and larger buzzers
+require a rated driver, not a direct GPIO connection. This interface controls GPIO
+outputs; arbitrary USB lights/buzzers need their own controller integration.
+
+`gpiozero` is included in requirements.txt. Actual GPIO use additionally needs a
+compatible Pi pin backend and GPIO permissions; Pi 5 requires lgpio. See the
+[GPIO Zero pin backend documentation](https://gpiozero.readthedocs.io/en/stable/api_pins.html).
+Hardware mode reports an initialization error on systems without GPIO; it does
+not silently fall back to simulation.
+
+An alarm triggers only for captured windows whose score meets `--threshold`.
+Model warmup, training, and file prediction do not activate it. Both outputs stay
+on for `--alarm-seconds` after the most recent detection (default 3 seconds).
+Normal windows do not end the hold early. A background timer handles expiry,
+so the alarm does not pause microphone processing. Ctrl+C or a capture/inference
+failure cancels the timer, turns outputs OFF, and releases the GPIO devices.
+GPIO errors during timer expiry are surfaced to the monitoring loop. Normal
+process cleanup cannot cover forced termination or power loss.
+
+The alarm uses the existing model and threshold; false glass detections also
+trigger it. No phone messages or notifications are sent. GPIO behavior is tested
+with simulated devices; deployment with a physical Pi/light/buzzer is unverified.
+
 Run the regression tests with `python -m unittest discover -s tests`.

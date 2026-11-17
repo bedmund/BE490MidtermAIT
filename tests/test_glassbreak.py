@@ -79,6 +79,19 @@ class GlassbreakTests(unittest.TestCase):
                     gb.predict_live('model.pth')
                 closed.assert_called_once()
 
+    def test_live_alarm_triggers_only_for_captured_glass_and_exits_cleanly(self):
+        sd, closed, _ = self.live_backend()
+        with patch.object(gb, 'load_prediction_model', return_value=(None, {})), \
+                patch.object(gb, 'get_audio_backend', return_value=sd), \
+                patch.object(gb, 'predict_features', side_effect=[[0.99], [0.2], [0.9]]), \
+                patch('alarm.AlarmOutputs') as alarm_factory, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gb.predict_live('model.pth', threshold=0.9, alarm_mode='simulate', alarm_seconds=5)
+        alarm_factory.assert_called_once_with('simulate', 17, 27, 5)
+        alarm_factory.return_value.__enter__.return_value.trigger.assert_called_once()
+        alarm_factory.return_value.__exit__.assert_called_once()
+        closed.assert_called_once()
+
     def test_file_and_microphone_buffer_use_identical_features(self):
         audio = np.sin(2 * np.pi * 1000 * np.arange(48000) / 16000).astype(np.float32) * 0.2
         with tempfile.TemporaryDirectory() as directory:

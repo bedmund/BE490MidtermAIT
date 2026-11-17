@@ -3,6 +3,7 @@ import argparse
 import copy
 import csv
 import queue
+from contextlib import nullcontext
 from pathlib import Path
 import numpy as np
 import librosa
@@ -320,7 +321,8 @@ def get_audio_backend():
     return sd
 
 
-def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, threshold=0.5):
+def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, threshold=0.5,
+                 alarm_mode="off", led_pin=17, buzzer_pin=27, alarm_seconds=3.0):
     model, checkpoint = load_prediction_model(checkpoint_path)
     sd = get_audio_backend()
     # Capture at the microphone's native rate, then resample to the training rate.
@@ -351,11 +353,16 @@ def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, thre
             raise sd.CallbackAbort
 
     try:
-        with sd.InputStream(device=device, samplerate=sample_rate, channels=1, dtype="float32",
+        from alarm import AlarmOutputs
+        alarm_context = (nullcontext(None) if alarm_mode == "off" else
+                         AlarmOutputs(alarm_mode, led_pin, buzzer_pin, alarm_seconds))
+        with alarm_context as alarm, sd.InputStream(device=device, samplerate=sample_rate, channels=1, dtype="float32",
                             blocksize=sample_rate * 3, callback=capture) as stream:
             print(f"Listening on {input_device['name']} in 3-second windows. Press Ctrl+C to stop.", flush=True)
             index = 0
             while True:
+                if alarm is not None:
+                    alarm.check()
                 if not errors.empty():
                     raise RuntimeError(errors.get())
                 try:
@@ -369,6 +376,8 @@ def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, thre
                 specs = extract_audio_features(audio)
                 probability = predict_features(model, checkpoint, specs)[0]
                 print_prediction(index, probability, threshold)
+                if alarm is not None and probability >= threshold:
+                    alarm.trigger()
                 index += 1
     except KeyboardInterrupt:
         print("\nMicrophone capture stopped. Any unfinished window was discarded.", flush=True)
@@ -384,11 +393,23 @@ if __name__ == "__main__":
     mode.add_argument("--list-input-devices", action="store_true", help="List audio devices and exit")
     parser.add_argument("--device", type=int, help="Microphone device index (default: system input)")
     parser.add_argument("--threshold", type=float, default=0.5, help="Glass score threshold for prediction")
+    parser.add_argument("--alarm", choices=("off", "simulate", "gpio"), default="off",
+                        help="Live light/buzzer alarm (simulate needs no hardware)")
+    parser.add_argument("--led-pin", type=int, default=17, help="LED BCM GPIO pin")
+    parser.add_argument("--buzzer-pin", type=int, default=27, help="Active buzzer BCM GPIO pin")
+    parser.add_argument("--alarm-seconds", type=float, default=3.0, help="Alarm hold time after each detection")
     parser.add_argument("--checkpoint", default="best_glass_break_model.pth")
     parser.add_argument("--epochs", type=int, default=30)
     args = parser.parse_args()
     if not 0 < args.threshold < 1:
         parser.error("--threshold must be between 0 and 1")
+    if args.alarm != "off":
+        if not args.live:
+            parser.error("--alarm requires --live")
+        if not np.isfinite(args.alarm_seconds) or args.alarm_seconds <= 0:
+            parser.error("--alarm-seconds must be positive and finite")
+        if args.led_pin == args.buzzer_pin or not all(0 <= pin <= 27 for pin in (args.led_pin, args.buzzer_pin)):
+            parser.error("Use distinct --led-pin and --buzzer-pin BCM numbers between 0 and 27")
     torch.manual_seed(42)
     np.random.seed(42)
     DATA_DIR = args.data_dir
@@ -397,7 +418,8 @@ if __name__ == "__main__":
     if args.list_input_devices:
         print(get_audio_backend().query_devices())
     elif args.live:
-        predict_live(args.checkpoint, args.device, args.threshold)
+        predict_live(args.checkpoint, args.device, args.threshold, args.alarm,
+                     args.led_pin, args.buzzer_pin, args.alarm_seconds)
     elif args.predict:
         predict_file(args.predict, args.checkpoint, args.threshold)
     elif os.path.exists(DATA_DIR):
