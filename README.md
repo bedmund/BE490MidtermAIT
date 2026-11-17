@@ -61,6 +61,44 @@ prints a warning; this does not guarantee independent underlying sources.
 checkpoint stores recording membership so later evaluation rejects changed splits.
 Audio windows/crops from one file never cross splits.
 
+Minimum validation coverage
+---------------------------
+
+Source-grouped runs no longer accept a split just because both classes occur.
+Before feature extraction or training, BOTH training and validation must contain:
+
+- At least 20 glass-containing recordings.
+- At least 10 distinct original annotated glass events.
+- At least 5 distinct original glass source recordings.
+- At least 5 distinct background recording sessions.
+- At least 20 non-glass recordings.
+
+Repeated mixtures of the same original event segment count once toward distinct
+events; three-second fragments and added training crops do not increase this
+coverage. Different segments from the same source recording count as separate
+events but only one independent source. Missing original segment bounds are
+counted conservatively as one event per source file.
+
+The seeded search considers several validation fractions (20%-40%) and the
+source-holdout strategy, always enforcing source isolation and the coverage
+floors. Coverage takes priority over matching an exact 80/20 proportion. No model
+scores or test-set results choose the split. Minimums apply to training too so
+validation cannot consume nearly all the independent positive training data.
+These are practical minimum coverage guards, not statistical confidence guarantees.
+
+Available/accepted counts are printed and written to `split_coverage.json`, even
+when coverage fails and training cannot start. Successful runs also include this
+information in `summary.json` and the checkpoint. Insufficient coverage or no
+qualifying split is an error, not a fallback to tiny validation. Add independent
+devtrain material if needed; additional remixes of an existing event/source do
+not solve a source-coverage shortage. No audio is deleted or modified.
+
+Retrain after this split change. An old checkpoint evaluated on the new validation
+recordings could have seen them during training, so its saved split manifest is
+checked and mismatches are rejected. The official devtest collection stays fixed.
+These coverage checks require `--recipes-dir`; the legacy file-split mode does
+not establish independent source coverage.
+
 Event-focused training crops
 ----------------------------
 

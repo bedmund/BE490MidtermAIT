@@ -136,7 +136,7 @@ def write_event_reports(directory, split, references, scores, threshold):
                 metric='merged positive-window episodes matched by any interval overlap; not DCASE scoring')
 
 
-def evaluate_and_report(validation, test, directory):
+def evaluate_and_report(validation, test, directory, split_coverage=None):
     """Each split is (labels, scores, references); test never selects a threshold."""
     val_labels, val_scores, val_references = validation
     selected, rows = select_validation_threshold(val_labels, val_scores)
@@ -147,6 +147,8 @@ def evaluate_and_report(validation, test, directory):
     summary = dict(metric_unit='three-second windows', selection='maximum validation glass F1',
                    selected_threshold=threshold, validation=selected,
                    validation_at_0_5=evaluate_thresholds(val_labels, val_scores, [0.5])[0])
+    if split_coverage is not None:
+        summary['split_coverage'] = split_coverage
     for split, (labels, scores, references) in [('validation', validation), ('test', test)]:
         write_window_reports(directory, split, references, labels, scores, threshold)
         if any(ref['event_label'] == 'glassbreak' for ref in references):

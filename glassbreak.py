@@ -2,6 +2,7 @@ import os
 import argparse
 import copy
 import csv
+import json
 import queue
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
@@ -113,7 +114,8 @@ def prepare_mixture_data(data_dir, metadata_dir, include_references=False, recip
     group_map = {}
     if recipes_dir is not None:
         from training_data import load_recipes, grouped_recording_split
-        train, validation, group_map = grouped_recording_split(recordings, load_recipes(recipes_dir))
+        train, validation, group_map = grouped_recording_split(
+            recordings, load_recipes(recipes_dir), diagnostics=split_audit)
         retained = {path for path, _ in train + validation}
         if split_audit is not None:
             split_audit['excluded'] = sorted(Path(path).name for path, _ in recordings['devtrain'] if path not in retained)
@@ -511,9 +513,16 @@ if __name__ == "__main__":
         predict_file(args.predict, args.checkpoint, args.threshold)
     elif os.path.exists(DATA_DIR):
         split_audit = {}
-        train_data, val_data, test_data = prepare_data_pipeline(
-            DATA_DIR, LABEL_MAP, args.metadata_dir, include_references=True,
-            recipes_dir=args.recipes_dir, event_crops=0 if args.evaluate else args.event_crops, split_audit=split_audit)
+        try:
+            train_data, val_data, test_data = prepare_data_pipeline(
+                DATA_DIR, LABEL_MAP, args.metadata_dir, include_references=True,
+                recipes_dir=args.recipes_dir, event_crops=0 if args.evaluate else args.event_crops, split_audit=split_audit)
+        finally:
+            if 'coverage' in split_audit:
+                Path(args.report_dir).mkdir(parents=True, exist_ok=True)
+                with (Path(args.report_dir) / 'split_coverage.json').open('w', encoding='utf-8') as output:
+                    json.dump(split_audit['coverage'], output, indent=2, allow_nan=False)
+                print(f"Split coverage diagnostics: {Path(args.report_dir) / 'split_coverage.json'}", flush=True)
         split_files = {name: sorted({ref['filename'] for ref in split[2]})
                        for name, split in zip(('train', 'validation', 'test'), (train_data, val_data, test_data))}
         if split_audit.get('excluded'):
@@ -555,7 +564,8 @@ if __name__ == "__main__":
             for inputs, _ in test_loader:
                 test_scores.extend(torch.sigmoid(trained_model(inputs)).flatten().tolist())
         threshold, summary = evaluate_and_report(
-            (val_data[1], val_scores, val_references), (test_data[1], test_scores, test_references), args.report_dir)
+            (val_data[1], val_scores, val_references), (test_data[1], test_scores, test_references), args.report_dir,
+            split_coverage=split_audit.get('coverage'))
         print(f"Selected threshold (validation glass F1): {threshold:.6g}")
         for name in ('validation_at_0_5', 'validation', 'test_at_0_5', 'test'):
             result = summary[name]
@@ -574,6 +584,7 @@ if __name__ == "__main__":
         torch.save({'model_state': trained_model.state_dict(), 'input_shape': list(sample_spec.shape),
                     'mean': mean, 'std': std, 'threshold': threshold,
                     'split_files': split_files, 'split_strategy': 'source_groups' if args.recipes_dir else 'files',
+                    'split_coverage': split_audit.get('coverage'),
                     'threshold_selection': 'maximum validation glass F1'}, output_checkpoint)
         print(f"Checkpoint saved to {output_checkpoint}; window-level reports saved to {args.report_dir}")
         from evaluation import write_csv

@@ -1,9 +1,62 @@
 """TUT recipe-based source isolation and training-only event crop positions."""
 
 from pathlib import Path, PurePosixPath
+from dataclasses import asdict, dataclass
 import re
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit
+
+
+@dataclass(frozen=True)
+class ValidationPolicy:
+    # Practical minimum coverage guards, not a guarantee of statistical precision.
+    min_glass_recordings: int = 20
+    min_glass_events: int = 10
+    min_glass_sources: int = 5
+    min_background_sources: int = 5
+    min_non_glass_recordings: int = 20
+
+    def __post_init__(self):
+        if any(type(value) is not int or value < 1 for value in asdict(self).values()):
+            raise ValueError('Validation coverage minimums must be positive integers')
+
+
+def coverage_rows(records, recipes):
+    rows = []
+    for path, event in records:
+        recipe = recipes[Path(path).name]
+        sources = recipe_sources(recipe)
+        glass = event is not None and event[2] == 'glassbreak'
+        source = next((key for key in sources if key.startswith('event:')), '') if glass else ''
+        # Mixture filename/timing is NOT an independent event. Repeated mixtures
+        # of the same original source segment count once. Missing segment bounds
+        # are counted conservatively as one event per original source file.
+        identity = (source, recipe.get('segment_start_seconds'), recipe.get('segment_end_seconds')) if glass else None
+        rows.append(dict(glass=glass, glass_source=source, glass_event=identity,
+                         background=next(key for key in sources if key.startswith('background:'))))
+    return rows
+
+
+def coverage_counts(rows, indices):
+    selected = [rows[i] for i in indices]
+    glass = [row for row in selected if row['glass']]
+    return dict(recordings=len(selected), glass_recordings=len(glass),
+                non_glass_recordings=len(selected) - len(glass),
+                glass_events=len({row['glass_event'] for row in glass}),
+                glass_sources=len({row['glass_source'] for row in glass}),
+                background_sources=len({row['background'] for row in selected}))
+
+
+def coverage_eligible(rows, train_ids, val_ids, policy):
+    for indices in (train_ids, val_ids):
+        # Apply the same floor to training to avoid improving validation by
+        # leaving the model with almost no independent glass training examples.
+        if len(indices) < policy.min_glass_recordings + policy.min_non_glass_recordings:
+            return False
+        counts = coverage_counts(rows, indices)
+        if any(counts[key.removeprefix('min_')] < minimum for key, minimum in asdict(policy).items()):
+            return False
+    return True
 
 
 def load_recipes(directory):
@@ -42,7 +95,8 @@ def recipe_sources(recipe):
     return sources
 
 
-def grouped_recording_split(recordings, recipes):
+def grouped_recording_split(recordings, recipes, policy=None, diagnostics=None):
+    policy = ValidationPolicy() if policy is None else policy
     sources = {}
     for subset, records in recordings.items():
         for path, event in records:
@@ -60,6 +114,21 @@ def grouped_recording_split(recordings, recipes):
             sources[name] = recipe_sources(recipe)
 
     train_records, test_records = recordings['devtrain'], recordings['devtest']
+    coverage = coverage_rows(train_records, recipes)
+    available = coverage_counts(coverage, range(len(coverage)))
+    coverage_report = dict(policy=asdict(policy), available_devtrain=available,
+                           criteria_apply_to='both training and validation', status='searching')
+    if diagnostics is not None:
+        diagnostics['coverage'] = coverage_report
+    # Both partitions must contain disjoint sources/events, so each minimum needs
+    # at least twice as many distinct examples in the full devtrain collection.
+    insufficient = [key.removeprefix('min_') for key, value in asdict(policy).items()
+                    if available[key.removeprefix('min_')] < 2 * value]
+    if insufficient:
+        coverage_report.update(status='insufficient_available_coverage', insufficient=insufficient)
+        raise ValueError(f'Insufficient independent devtrain coverage for the validation policy: {available}. '
+                         f'Each partition requires {asdict(policy)}. Add independent devtrain recordings; '
+                         'repeated mixtures of the same event do not increase source/event coverage.')
     train_sources = set().union(*(sources[Path(path).name] for path, _ in train_records))
     test_sources = set().union(*(sources[Path(path).name] for path, _ in test_records))
     if train_sources & test_sources:
@@ -86,13 +155,15 @@ def grouped_recording_split(recordings, recipes):
     labels = np.array([int(event is not None and event[2] == 'glassbreak') for _, event in train_records])
     best = None
     if len(set(groups)) > 1:
-        splitter = GroupShuffleSplit(n_splits=200, test_size=0.2, random_state=42)
-        for train_ids, val_ids in splitter.split(np.zeros(len(groups)), labels, groups):
-            if set(labels[train_ids]) != {0, 1} or set(labels[val_ids]) != {0, 1}:
-                continue
-            cost = abs(len(val_ids) / len(groups) - 0.2) + abs(labels[val_ids].mean() - labels.mean())
-            if best is None or cost < best[0]:
-                best = (cost, train_ids, val_ids)
+        # Coverage takes precedence over an exact 80/20 proportion.
+        for fraction in (0.2, 0.25, 0.3, 0.35, 0.4):
+            splitter = GroupShuffleSplit(n_splits=200, test_size=fraction, random_state=42)
+            for train_ids, val_ids in splitter.split(np.zeros(len(groups)), labels, groups):
+                if not coverage_eligible(coverage, train_ids, val_ids, policy):
+                    continue
+                cost = abs(len(val_ids) / len(groups) - 0.2) + abs(labels[val_ids].mean() - labels.mean())
+                if best is None or cost < best[0]:
+                    best = (cost, train_ids, val_ids)
     if best is not None:
         _, train_ids, val_ids = best
         group_names = {value: f'devtrain-group-{index:04d}' for index, value in enumerate(sorted(set(groups)))}
@@ -100,7 +171,11 @@ def grouped_recording_split(recordings, recipes):
     else:
         # When shared sources connect most mixtures, hold out sources and quarantine
         # connecting mixtures. No excluded audio is deleted or relabeled.
-        train_ids, val_ids = source_holdout_split(train_records, sources, labels)
+        try:
+            train_ids, val_ids = source_holdout_split(train_records, sources, labels, coverage, policy)
+        except ValueError:
+            coverage_report['status'] = 'no_qualifying_source_split_found'
+            raise
         group_map = {Path(path).name: 'excluded-cross-source' for path, _ in train_records}
         for name, indices in [('source-holdout-train', train_ids), ('source-holdout-validation', val_ids)]:
             for index in indices:
@@ -112,17 +187,26 @@ def grouped_recording_split(recordings, recipes):
     if train_keys & val_keys:
         raise AssertionError('Internal error: source leakage in grouped split')
     print(f'Source-isolated split: {len(train_ids)} train and {len(val_ids)} validation recordings', flush=True)
+    coverage_report.update(status='accepted', train=coverage_counts(coverage, train_ids),
+                           validation=coverage_counts(coverage, val_ids),
+                           excluded_recordings=len(train_records) - len(train_ids) - len(val_ids))
+    for split in ('train', 'validation'):
+        counts = coverage_report[split]
+        print(f"{split} coverage: {counts['glass_recordings']} glass recordings, "
+              f"{counts['glass_events']} unique glass events, {counts['glass_sources']} glass sources, "
+              f"{counts['background_sources']} background sources, "
+              f"{counts['non_glass_recordings']} non-glass recordings", flush=True)
     return [train_records[i] for i in train_ids], [train_records[i] for i in val_ids], group_map
 
 
-def source_holdout_split(records, sources, labels):
+def source_holdout_split(records, sources, labels, coverage, policy):
     rng = np.random.RandomState(42)
     source_sets = [sources[Path(path).name] for path, _ in records]
     all_sources = set().union(*source_sets)
     backgrounds = sorted(source for source in all_sources if source.startswith('background:'))
     events = sorted(source for source in all_sources if source.startswith('event:'))
     best = None
-    for _ in range(400):
+    for _ in range(2000):
         held = set(rng.choice(backgrounds, max(1, round(len(backgrounds) * rng.uniform(0.15, 0.45))), replace=False))
         if events:
             held.update(rng.choice(events, max(1, round(len(events) * rng.uniform(0.15, 0.45))), replace=False))
@@ -133,6 +217,8 @@ def source_holdout_split(records, sources, labels):
         training = [i for i, keys in enumerate(source_sets) if not keys & validation_sources]
         if not training or set(labels[training]) != {0, 1}:
             continue
+        if not coverage_eligible(coverage, training, validation, policy):
+            continue
         retained = len(training) + len(validation)
         cost = (abs(len(validation) / retained - 0.2)
                 + abs(labels[validation].mean() - labels.mean())
@@ -140,8 +226,9 @@ def source_holdout_split(records, sources, labels):
         if best is None or cost < best[0]:
             best = (cost, training, validation)
     if best is None:
-        raise ValueError('All devtrain mixtures are too interconnected to form independent training/validation '
-                         'with both classes. Provide more independent sources; no file-split fallback is used.')
+        raise ValueError('All devtrain mixtures were searched, but no source-isolated split meeting '
+                         f'the coverage policy was found: {asdict(policy)}. Add more independent '
+                         'devtrain sources. No tiny-validation or file-split fallback is used.')
     return best[1:]
 
 

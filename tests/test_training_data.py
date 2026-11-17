@@ -4,10 +4,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from training_data import event_crop_starts, grouped_recording_split, load_recipes, recipe_sources
+from training_data import event_crop_starts, grouped_recording_split, load_recipes, recipe_sources, ValidationPolicy, coverage_rows, coverage_counts
 
 
 class TrainingDataTests(unittest.TestCase):
+    # Tiny fixtures explicitly lower the production coverage floor.
+    policy = ValidationPolicy(2, 2, 2, 2, 1)
+
     def data(self):
         records = {'devtrain': [], 'devtest': []}
         recipes = {}
@@ -26,8 +29,8 @@ class TrainingDataTests(unittest.TestCase):
     def test_shared_sources_never_cross_splits_and_result_is_repeatable(self):
         records, recipes = self.data()
         with contextlib.redirect_stdout(io.StringIO()):
-            train, val, groups = grouped_recording_split(records, recipes)
-            again = grouped_recording_split(records, recipes)
+            train, val, groups = grouped_recording_split(records, recipes, policy=self.policy)
+            again = grouped_recording_split(records, recipes, policy=self.policy)
         self.assertEqual(train, again[0])
         self.assertEqual(val, again[1])
         source_sets = []
@@ -46,7 +49,7 @@ class TrainingDataTests(unittest.TestCase):
         recipes[names[3]]['event_path'] = recipes[names[0]]['event_path']
         recipes[names[4]]['bg_path'] = recipes[names[3]]['bg_path'].replace('_0_30', '_30_60')
         with contextlib.redirect_stdout(io.StringIO()):
-            _, _, groups = grouped_recording_split(records, recipes)
+            _, _, groups = grouped_recording_split(records, recipes, policy=self.policy)
         self.assertEqual(groups[names[0]], groups[names[3]])
         self.assertEqual(groups[names[3]], groups[names[4]])
 
@@ -55,15 +58,50 @@ class TrainingDataTests(unittest.TestCase):
         missing = dict(recipes)
         missing.pop(records['devtrain'][0][0])
         with self.assertRaisesRegex(ValueError, 'Missing mixture recipe'):
-            grouped_recording_split(records, missing)
+            grouped_recording_split(records, missing, policy=self.policy)
         recipes[records['devtrain'][0][0]]['event_present'] = False
         with self.assertRaisesRegex(ValueError, 'presence mismatch'):
-            grouped_recording_split(records, recipes)
+            grouped_recording_split(records, recipes, policy=self.policy)
         records, recipes = self.data()
         for path, _ in records['devtrain']:
             recipes[path]['bg_path'] = 'audio/shared_0_30.wav'
-        with self.assertRaisesRegex(ValueError, 'All devtrain mixtures'):
-            grouped_recording_split(records, recipes)
+        with self.assertRaisesRegex(ValueError, 'Insufficient independent|All devtrain mixtures'):
+            grouped_recording_split(records, recipes, policy=self.policy)
+
+    def test_production_policy_rejects_tiny_validation_collection_and_reports_counts(self):
+        records, recipes = self.data()
+        diagnostics = {}
+        with self.assertRaisesRegex(ValueError, 'Insufficient independent devtrain coverage'):
+            grouped_recording_split(records, recipes, diagnostics=diagnostics)
+        report = diagnostics['coverage']
+        self.assertEqual(report['status'], 'insufficient_available_coverage')
+        self.assertEqual(report['available_devtrain']['glass_recordings'], 20)
+        self.assertEqual(report['available_devtrain']['glass_events'], 10)
+        self.assertEqual(report['policy']['min_glass_recordings'], 20)
+
+    def test_repeated_mixtures_do_not_inflate_distinct_glass_events(self):
+        records, recipes = self.data()
+        for path, event in records['devtrain']:
+            if event is not None:
+                recipes[path]['event_path'] = 'glassbreak/shared.wav'
+                recipes[path]['segment_start_seconds'] = 1.0
+                recipes[path]['segment_end_seconds'] = 1.6
+        rows = coverage_rows(records['devtrain'], recipes)
+        counts = coverage_counts(rows, range(len(rows)))
+        self.assertEqual(counts['glass_recordings'], 20)
+        self.assertEqual(counts['glass_events'], 1)
+        self.assertEqual(counts['glass_sources'], 1)
+
+    def test_accepted_split_meets_explicit_coverage_policy(self):
+        records, recipes = self.data()
+        diagnostics = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            grouped_recording_split(records, recipes, policy=self.policy, diagnostics=diagnostics)
+        report = diagnostics['coverage']
+        self.assertEqual(report['status'], 'accepted')
+        for split in ('train', 'validation'):
+            for key, minimum in report['policy'].items():
+                self.assertGreaterEqual(report[split][key.removeprefix('min_')], minimum)
 
     def test_yaml_recipe_format_and_missing_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,7 +118,7 @@ class TrainingDataTests(unittest.TestCase):
         for group in range(1, 10):
             recipes[names[group * 3]]['event_path'] = recipes[names[(group - 1) * 3 + 1]]['event_path']
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            train, val, groups = grouped_recording_split(records, recipes)
+            train, val, groups = grouped_recording_split(records, recipes, policy=self.policy)
         self.assertLess(len(train) + len(val), len(names))
         train_keys = set().union(*(recipe_sources(recipes[path]) for path, _ in train))
         val_keys = set().union(*(recipe_sources(recipes[path]) for path, _ in val))
