@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
+from types import SimpleNamespace
 
 import numpy as np
 import soundfile as sf
@@ -14,6 +16,76 @@ import glassbreak as gb
 
 
 class GlassbreakTests(unittest.TestCase):
+    def live_backend(self, status=None, window_count=2):
+        class CallbackAbort(Exception):
+            pass
+
+        closed = Mock()
+        captured = {}
+
+        class Stream:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def __enter__(self):
+                for index in range(window_count):
+                    data = np.full((96000, 1), index / 10, dtype=np.float32)
+                    try:
+                        captured['callback'](data, len(data), None, status)
+                    except CallbackAbort:
+                        break
+                return self
+
+            @property
+            def active(self):
+                raise KeyboardInterrupt
+
+            def __exit__(self, *args):
+                closed()
+
+        sd = SimpleNamespace(
+            InputStream=Stream, CallbackAbort=CallbackAbort,
+            query_devices=Mock(return_value={'name': 'Test microphone', 'default_samplerate': 32000}),
+            check_input_settings=Mock())
+        return sd, closed, captured
+
+    def test_live_resamples_every_window_and_closes_on_interrupt(self):
+        sd, closed, captured = self.live_backend()
+        with patch.object(gb, 'load_prediction_model', return_value=(None, {})), \
+                patch.object(gb, 'get_audio_backend', return_value=sd), \
+                patch.object(gb, 'predict_features', side_effect=[[0.0], [0.2], [0.9]]) as prediction, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            gb.predict_live('model.pth', device=7)
+        self.assertEqual(prediction.call_count, 3)  # Warmup plus two captured windows.
+        self.assertEqual(prediction.call_args.args[2].shape, (1, 64, 94))
+        self.assertEqual(captured['blocksize'], 96000)
+        self.assertEqual(captured['device'], 7)
+        sd.check_input_settings.assert_called_once_with(device=7, channels=1, dtype='float32', samplerate=32000)
+        self.assertIn('0.0-3.0s: normal', output.getvalue())
+        self.assertIn('3.0-6.0s: glass_breaking', output.getvalue())
+        self.assertIn('capture stopped', output.getvalue())
+        closed.assert_called_once()
+
+    def test_live_capture_errors_and_backlog_are_not_silent(self):
+        for status, count, message in [('input overflow', 1, 'capture interrupted'),
+                                       (None, 5, 'falling behind')]:
+            with self.subTest(status=status):
+                sd, closed, _ = self.live_backend(status=status, window_count=count)
+                with patch.object(gb, 'load_prediction_model', return_value=(None, {})), \
+                        patch.object(gb, 'get_audio_backend', return_value=sd), \
+                        patch.object(gb, 'predict_features', return_value=[0.0]), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        self.assertRaisesRegex(RuntimeError, message):
+                    gb.predict_live('model.pth')
+                closed.assert_called_once()
+
+    def test_file_and_microphone_buffer_use_identical_features(self):
+        audio = np.sin(2 * np.pi * 1000 * np.arange(48000) / 16000).astype(np.float32) * 0.2
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'window.wav'
+            sf.write(path, audio, 16000, subtype='FLOAT')
+            np.testing.assert_allclose(gb.extract_features(path), gb.extract_audio_features(audio), atol=1e-5)
+
     def test_mixture_annotations_override_folders_and_keep_devtest_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

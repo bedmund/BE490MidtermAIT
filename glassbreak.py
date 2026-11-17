@@ -2,6 +2,7 @@ import os
 import argparse
 import copy
 import csv
+import queue
 from pathlib import Path
 import numpy as np
 import librosa
@@ -26,23 +27,27 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         return self.features[idx], self.labels[idx]
 
+def extract_audio_features(audio, sr=16000, duration=3.0, n_mels=64):
+    if len(audio) == 0:
+        raise ValueError("Audio clip is empty")
+    target_length = int(sr * duration)
+    if target_length <= 0:
+        raise ValueError("Window duration must be positive")
+    features = []
+    for start in range(0, len(audio), target_length):
+        segment = audio[start:start + target_length]
+        segment = np.pad(segment, (0, target_length - len(segment)))
+        mel_spec = librosa.feature.melspectrogram(y=segment, sr=sr, n_mels=n_mels, n_fft=2048, hop_length=512)
+        # Fixed reference preserves level differences between quiet and loud windows.
+        log_mel_spec = librosa.power_to_db(mel_spec, ref=1.0)
+        features.append(log_mel_spec)
+    return np.array(features)
+
+
 def extract_features(file_path, sr=16000, duration=3.0, n_mels=64):
     try:
         audio, _ = librosa.load(file_path, sr=sr)
-        if len(audio) == 0:
-            raise ValueError("Audio clip is empty")
-        target_length = int(sr * duration)
-        if target_length <= 0:
-            raise ValueError("Window duration must be positive")
-        features = []
-        for start in range(0, len(audio), target_length):
-            segment = audio[start:start + target_length]
-            segment = np.pad(segment, (0, target_length - len(segment)))
-            mel_spec = librosa.feature.melspectrogram(y=segment, sr=sr, n_mels=n_mels, n_fft=2048, hop_length=512)
-            # Fixed reference preserves level differences between quiet and loud windows.
-            log_mel_spec = librosa.power_to_db(mel_spec, ref=1.0)
-            features.append(log_mel_spec)
-        return np.array(features)
+        return extract_audio_features(audio, sr, duration, n_mels)
     except Exception as e:
         print(f"Error processing {file_path}: {e}")
         return None
@@ -269,42 +274,132 @@ def train_and_evaluate_model(model, train_loader, val_loader, epochs=10, lr=0.00
     return model
 
 
-def predict_file(file_path, checkpoint_path="best_glass_break_model.pth"):
+def load_prediction_model(checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if "model_state" not in checkpoint:
         raise ValueError("This checkpoint uses the old preprocessing. Retrain with this script first.")
-    specs = extract_features(file_path)
-    if specs is None:
-        raise ValueError(f"Cannot read audio: {file_path}")
+    if not np.isfinite(checkpoint["mean"]) or not np.isfinite(checkpoint["std"]) or checkpoint["std"] <= 0:
+        raise ValueError("Checkpoint normalization statistics are invalid")
     model = BaselineAudioCNN(*checkpoint["input_shape"])
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
+    return model, checkpoint
+
+
+def predict_features(model, checkpoint, specs):
     inputs = torch.tensor((specs - checkpoint["mean"]) / checkpoint["std"], dtype=torch.float32).unsqueeze(1)
     probabilities = []
     with torch.no_grad():
         for batch in inputs.split(16):
             probabilities.extend(torch.sigmoid(model(batch)).flatten().tolist())
-    for i, probability in enumerate(probabilities):
-        label = "glass_breaking" if probability >= 0.5 else "normal"
-        print(f"{i * 3:.1f}-{(i + 1) * 3:.1f}s: {label} (glass score: {probability:.3f})")
     return probabilities
+
+
+def print_prediction(index, probability, threshold=0.5):
+    label = "glass_breaking" if probability >= threshold else "normal"
+    print(f"{index * 3:.1f}-{(index + 1) * 3:.1f}s: {label} (glass score: {probability:.3f})", flush=True)
+
+
+def predict_file(file_path, checkpoint_path="best_glass_break_model.pth", threshold=0.5):
+    model, checkpoint = load_prediction_model(checkpoint_path)
+    specs = extract_features(file_path)
+    if specs is None:
+        raise ValueError(f"Cannot read audio: {file_path}")
+    probabilities = predict_features(model, checkpoint, specs)
+    for index, probability in enumerate(probabilities):
+        print_prediction(index, probability, threshold)
+    return probabilities
+
+
+def get_audio_backend():
+    try:
+        import sounddevice as sd
+    except (ImportError, OSError) as error:
+        raise RuntimeError("Microphone capture needs sounddevice and PortAudio. "
+                           "Install requirements.txt; on Ubuntu install libportaudio2.") from error
+    return sd
+
+
+def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, threshold=0.5):
+    model, checkpoint = load_prediction_model(checkpoint_path)
+    sd = get_audio_backend()
+    # Capture at the microphone's native rate, then resample to the training rate.
+    input_device = sd.query_devices(device, "input")
+    sample_rate = int(round(input_device["default_samplerate"]))
+    sd.check_input_settings(device=device, channels=1, dtype="float32", samplerate=sample_rate)
+    # Load feature kernels/model inference before recording so cold-start work
+    # cannot fill the capture queue before the first real prediction.
+    print("Preparing live audio processing...", flush=True)
+    if sample_rate != 16000:
+        librosa.resample(np.zeros(sample_rate * 3, dtype=np.float32), orig_sr=sample_rate, target_sr=16000)
+    predict_features(model, checkpoint, extract_audio_features(np.zeros(48000, dtype=np.float32)))
+    windows = queue.Queue(maxsize=4)
+    errors = queue.SimpleQueue()
+
+    def capture(indata, frames, time_info, status):
+        # Never run the CNN or block on the audio callback thread.
+        if status:
+            errors.put(f"Microphone capture interrupted: {status}")
+            raise sd.CallbackAbort
+        if frames != sample_rate * 3:
+            errors.put("Microphone returned an incomplete three-second window")
+            raise sd.CallbackAbort
+        try:
+            windows.put_nowait(indata[:, 0].copy())
+        except queue.Full:
+            errors.put("Inference is falling behind microphone capture; stopped to avoid losing audio silently")
+            raise sd.CallbackAbort
+
+    try:
+        with sd.InputStream(device=device, samplerate=sample_rate, channels=1, dtype="float32",
+                            blocksize=sample_rate * 3, callback=capture) as stream:
+            print(f"Listening on {input_device['name']} in 3-second windows. Press Ctrl+C to stop.", flush=True)
+            index = 0
+            while True:
+                if not errors.empty():
+                    raise RuntimeError(errors.get())
+                try:
+                    audio = windows.get(timeout=0.2)
+                except queue.Empty:
+                    if not stream.active:
+                        raise RuntimeError("Microphone stream stopped unexpectedly")
+                    continue
+                if sample_rate != 16000:
+                    audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
+                specs = extract_audio_features(audio)
+                probability = predict_features(model, checkpoint, specs)[0]
+                print_prediction(index, probability, threshold)
+                index += 1
+    except KeyboardInterrupt:
+        print("\nMicrophone capture stopped. Any unfinished window was discarded.", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train on labeled recordings or classify every 3-second window.")
     parser.add_argument("--data-dir", default="./dataset")
     parser.add_argument("--metadata-dir", help="Directory containing current TUT mixture event-list CSVs")
-    parser.add_argument("--predict", metavar="AUDIO_FILE")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--predict", metavar="AUDIO_FILE")
+    mode.add_argument("--live", action="store_true", help="Classify microphone audio until Ctrl+C")
+    mode.add_argument("--list-input-devices", action="store_true", help="List audio devices and exit")
+    parser.add_argument("--device", type=int, help="Microphone device index (default: system input)")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Glass score threshold for prediction")
     parser.add_argument("--checkpoint", default="best_glass_break_model.pth")
     parser.add_argument("--epochs", type=int, default=30)
     args = parser.parse_args()
+    if not 0 < args.threshold < 1:
+        parser.error("--threshold must be between 0 and 1")
     torch.manual_seed(42)
     np.random.seed(42)
     DATA_DIR = args.data_dir
     LABEL_MAP = {"normal": 0, "glass_breaking": 1}
     
-    if args.predict:
-        predict_file(args.predict, args.checkpoint)
+    if args.list_input_devices:
+        print(get_audio_backend().query_devices())
+    elif args.live:
+        predict_live(args.checkpoint, args.device, args.threshold)
+    elif args.predict:
+        predict_file(args.predict, args.checkpoint, args.threshold)
     elif os.path.exists(DATA_DIR):
         train_data, val_data, test_data = prepare_data_pipeline(DATA_DIR, LABEL_MAP, args.metadata_dir)
         # Fit normalization only on training audio; reuse it for all later inputs.

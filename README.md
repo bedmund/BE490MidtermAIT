@@ -67,6 +67,46 @@ must be retrained. Use `--checkpoint path/to/new_model.pth` on both commands to 
 and load an alternative checkpoint without overwriting the original.
 Models previously trained with folder-level mixture labels should also be retrained.
 
-No live microphone processing or phone notifications are implemented.
+Listen to a microphone with an existing trained checkpoint (no CSVs or dataset needed):
+
+```sh
+python glassbreak.py --list-input-devices
+python glassbreak.py --live --checkpoint prototype_annotated.pth
+```
+
+To select a microphone by its device index from the list:
+
+```sh
+python glassbreak.py --live --device 2 --checkpoint prototype_annotated.pth
+```
+
+On Ubuntu/Linux, PortAudio may need to be installed before microphone capture:
+
+```sh
+sudo apt install libportaudio2
+python -m pip install -r requirements.txt
+```
+
+If running inside a VM, enable microphone/audio-input passthrough in the VM and
+allow microphone access on the host. The device list must show an input device
+available inside the VM; an SSH session does not automatically forward your local
+microphone. Device indices may change, so check the list after reconnecting.
+
+Live capture uses mono audio at the device's default sample rate, resamples to
+16 kHz, and applies exactly the same three-second log-mel features and checkpoint
+normalization as file prediction. A callback captures successive windows while
+the main thread runs inference. Results show elapsed capture intervals and glass
+scores after each completed window (at least three seconds plus processing/device
+latency). Ctrl+C closes the microphone; unfinished audio is discarded. Audio is
+held in memory only and is not saved or transmitted. Capture errors or a full
+four-window queue stop monitoring with an error rather than silently losing audio.
+
+Prediction uses threshold 0.5 by default. Both `--live` and `--predict` accept
+`--threshold`, e.g. `--threshold 0.7`; choose a threshold using validation data,
+not test data. This option does not change training or its evaluation threshold.
+Live capture does not improve the existing model's detection accuracy; the
+previously observed false alarms and missed events remain relevant.
+
+Phone notifications are not implemented.
 
 Run the regression tests with `python -m unittest discover -s tests`.
