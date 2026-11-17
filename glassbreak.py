@@ -3,7 +3,7 @@ import argparse
 import copy
 import csv
 import queue
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 import numpy as np
 import librosa
@@ -322,7 +322,8 @@ def get_audio_backend():
 
 
 def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, threshold=0.5,
-                 alarm_mode="off", led_pin=17, buzzer_pin=27, alarm_seconds=3.0):
+                 alarm_mode="off", led_pin=17, buzzer_pin=27, alarm_seconds=3.0,
+                 email_alerts=False, email_cooldown=60.0):
     model, checkpoint = load_prediction_model(checkpoint_path)
     sd = get_audio_backend()
     # Capture at the microphone's native rate, then resample to the training rate.
@@ -354,10 +355,17 @@ def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, thre
 
     try:
         from alarm import AlarmOutputs
-        alarm_context = (nullcontext(None) if alarm_mode == "off" else
-                         AlarmOutputs(alarm_mode, led_pin, buzzer_pin, alarm_seconds))
-        with alarm_context as alarm, sd.InputStream(device=device, samplerate=sample_rate, channels=1, dtype="float32",
-                            blocksize=sample_rate * 3, callback=capture) as stream:
+        with ExitStack() as stack:
+            alarm_context = (nullcontext(None) if alarm_mode == "off" else
+                             AlarmOutputs(alarm_mode, led_pin, buzzer_pin, alarm_seconds))
+            alarm = stack.enter_context(alarm_context)
+            notifier = None
+            if email_alerts:
+                from email_alerts import EmailAlerts
+                notifier = stack.enter_context(EmailAlerts(email_cooldown))
+            stream = stack.enter_context(sd.InputStream(
+                device=device, samplerate=sample_rate, channels=1, dtype="float32",
+                blocksize=sample_rate * 3, callback=capture))
             print(f"Listening on {input_device['name']} in 3-second windows. Press Ctrl+C to stop.", flush=True)
             index = 0
             while True:
@@ -378,6 +386,8 @@ def predict_live(checkpoint_path="best_glass_break_model.pth", device=None, thre
                 print_prediction(index, probability, threshold)
                 if alarm is not None and probability >= threshold:
                     alarm.trigger()
+                if notifier is not None and probability >= threshold:
+                    notifier.notify(probability, index * 3, (index + 1) * 3)
                 index += 1
     except KeyboardInterrupt:
         print("\nMicrophone capture stopped. Any unfinished window was discarded.", flush=True)
@@ -398,11 +408,15 @@ if __name__ == "__main__":
     parser.add_argument("--led-pin", type=int, default=17, help="LED BCM GPIO pin")
     parser.add_argument("--buzzer-pin", type=int, default=27, help="Active buzzer BCM GPIO pin")
     parser.add_argument("--alarm-seconds", type=float, default=3.0, help="Alarm hold time after each detection")
+    parser.add_argument("--email-alerts", action="store_true", help="Send live Gmail alerts using private email_config.py")
+    parser.add_argument("--email-cooldown", type=float, default=60.0, help="Minimum seconds between queued emails")
     parser.add_argument("--checkpoint", default="best_glass_break_model.pth")
     parser.add_argument("--epochs", type=int, default=30)
     args = parser.parse_args()
     if not 0 < args.threshold < 1:
         parser.error("--threshold must be between 0 and 1")
+    if args.email_alerts and (not args.live or not np.isfinite(args.email_cooldown) or args.email_cooldown <= 0):
+        parser.error("--email-alerts requires --live and a positive finite --email-cooldown")
     if args.alarm != "off":
         if not args.live:
             parser.error("--alarm requires --live")
@@ -419,7 +433,8 @@ if __name__ == "__main__":
         print(get_audio_backend().query_devices())
     elif args.live:
         predict_live(args.checkpoint, args.device, args.threshold, args.alarm,
-                     args.led_pin, args.buzzer_pin, args.alarm_seconds)
+                     args.led_pin, args.buzzer_pin, args.alarm_seconds,
+                     args.email_alerts, args.email_cooldown)
     elif args.predict:
         predict_file(args.predict, args.checkpoint, args.threshold)
     elif os.path.exists(DATA_DIR):

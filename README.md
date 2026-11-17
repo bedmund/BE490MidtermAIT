@@ -107,7 +107,45 @@ not test data. This option does not change training or its evaluation threshold.
 Live capture does not improve the existing model's detection accuracy; the
 previously observed false alarms and missed events remain relevant.
 
-Phone notifications are not implemented.
+Gmail email alerts
+------------------
+
+Email alerts are disabled by default. Copy `email_config.example.py` to
+`email_config.py` beside the script, then edit and uncomment all three dummy fields:
+`GMAIL_SENDER`, `EMAIL_RECIPIENT`, and `GMAIL_APP_PASSWORD`. Use your dedicated Gmail
+account as sender and your iCloud (or other) address as recipient. Use a Google App
+Password, not your ordinary password. App Password availability depends on your
+Google account security settings and requires 2-Step Verification. No recipient
+password is needed. `email_config.py` is Git-ignored; never commit real credentials.
+
+```sh
+python glassbreak.py --live --checkpoint prototype_annotated.pth --email-alerts
+```
+
+Combine email and the simulated alarm if desired:
+
+```sh
+python glassbreak.py --live --checkpoint prototype_annotated.pth --alarm simulate --email-alerts --email-cooldown 60
+```
+
+Each eligible live glass detection queues a plain-text email containing the UTC
+detection time, elapsed audio interval, and glass score. No audio is attached.
+Sending uses Gmail SMTP over verified TLS on port 465 with a 10-second socket
+timeout. A background worker keeps network requests off the audio processing
+thread. There is at most one queued message, and the default cooldown is 60
+seconds between queued alerts (including attempts that later fail). This limits
+false-alarm email volume; it does not guarantee delivery or detector accuracy.
+
+SMTP/network failures are logged by exception type without printing credentials;
+live detection continues. There are no automatic retries, avoiding duplicate
+messages after ambiguous SMTP failures. Later eligible detections may send new
+alerts. On shutdown, pending messages are discarded; an in-flight send may finish.
+Gmail acceptance is not confirmation of delivery to your inbox. Delivery and phone
+notifications depend on mail-provider and iPhone settings. Email is not P2P.
+
+The implementation uses Python's standard library, so no extra requirements.txt
+package is needed. Email tests mock SMTP and do not send messages. Configure and
+test your own account before a demonstration.
 
 Optional light and active-buzzer alarm
 ------------------------------------
@@ -151,7 +189,7 @@ GPIO errors during timer expiry are surfaced to the monitoring loop. Normal
 process cleanup cannot cover forced termination or power loss.
 
 The alarm uses the existing model and threshold; false glass detections also
-trigger it. No phone messages or notifications are sent. GPIO behavior is tested
+trigger it. Email is sent only when separately enabled with `--email-alerts`. GPIO behavior is tested
 with simulated devices; deployment with a physical Pi/light/buzzer is unverified.
 
 Run the regression tests with `python -m unittest discover -s tests`.
